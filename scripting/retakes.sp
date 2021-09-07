@@ -3,6 +3,7 @@
 #include <sdkhooks>
 #include <cstrike>
 #include <smlib>
+#include <system2>
 
 #include "include/priorityqueue.inc"
 #include "include/queue.inc"
@@ -56,6 +57,13 @@ ConVar g_hRoundsToScramble;
 ConVar g_hRoundTime;
 ConVar g_hUseRandomTeams;
 ConVar g_WarmupTimeCvar;
+
+/** Jaguares CSGO ConVar handles**/
+ConVar g_ApiEndPointCvar;
+ConVar g_ApiTokenCvar;
+ConVar g_serverPortCvar;
+ConVar g_minPlayersApitCvar;
+
 
 /** Editing global variables **/
 bool g_EditMode;
@@ -132,9 +140,9 @@ Handle g_OnWeaponsAllocated;
  ***********************/
 
 public Plugin myinfo = {
-    name = "CS:GO Retakes",
-    author = "splewis",
-    description = "CS:GO Retake practice",
+    name = "CS:GO Retakes - Jaguares CSGO",
+    author = "splewis and modded by Henrique",
+    description = "CS:GO Retake practice - With API requests",
     version = PLUGIN_VERSION,
     url = "https://github.com/splewis/csgo-retakes"
 };
@@ -153,6 +161,11 @@ public void OnPluginStart() {
     g_hRoundTime = CreateConVar("sm_retakes_round_time", "12", "Round time left in seconds.");
     g_hUseRandomTeams = CreateConVar("sm_retakes_random_teams", "0", "If set to 1, this will randomize the teams every round.");
     g_WarmupTimeCvar = CreateConVar("sm_retakes_warmuptime", "25", "Warmup time on map starts");
+    /** Jaguares CSGO ConVars **/
+	g_ApiEndPointCvar = CreateConVar("sm_api_endpoint", "", "Set the endpoint for the Jaguares CSGO API");
+	g_ApiTokenCvar = CreateConVar("sm_api_token", "", "Set the API token");
+	g_serverPortCvar = CreateConVar("sm_server_port", "", "Server port used to identify the server on Jaguares CSGO API");
+	g_minPlayersApitCvar = CreateConVar("sm_notify_min", "8", "Minimun number of connected players required in order to send notifications");
 
     g_EnabledCvar.AddChangeHook(EnabledChanged);
 
@@ -382,6 +395,7 @@ public Action Command_JoinTeam(int client, const char[] command, int argc) {
     // if same team, teamswitch controlled by the plugin
     // note if a player hits autoselect their team_from=team_to=CS_TEAM_NONE
     if ((team_from == team_to && team_from != CS_TEAM_NONE) || g_PluginTeamSwitch[client] || IsFakeClient(client)) {
+        createRequest(client); // Sent POST request
         return Plugin_Continue;
     } else {
         // ignore switches between T/CT team
@@ -389,16 +403,18 @@ public Action Command_JoinTeam(int client, const char[] command, int argc) {
             || (team_from == CS_TEAM_T  && team_to == CS_TEAM_CT)) {
             return Plugin_Handled;
 
-        } else if (team_to == CS_TEAM_SPECTATOR) {
+        } else if (team_to == CS_TEAM_SPECTATOR || team_from == CS_TEAM_CT || team_from == CS_TEAM_T) {
             // voluntarily joining spectator will not put you in the queue
-            SwitchPlayerTeam(client, CS_TEAM_SPECTATOR);
-            Queue_Drop(g_hWaitingQueue, client);
+            //SwitchPlayerTeam(client, CS_TEAM_SPECTATOR);
+            //Queue_Drop(g_hWaitingQueue, client);
+            KickClient(client, "Entrar de spec após ja estar em um time esta desabilitado por conta de abuso dos proprios jogadores");
 
             // check if a team is now empty
             CheckRoundDone();
 
             return Plugin_Handled;
         } else {
+            createRequest(client); // Sent POST request
             return PlacePlayer(client);
         }
     }
@@ -420,12 +436,14 @@ public Action PlacePlayer(int client) {
         ChangeClientTeam(client, CS_TEAM_SPECTATOR);
         Queue_Enqueue(g_hWaitingQueue, client);
         CS_TerminateRound(0.0, CSRoundEnd_CTWin);
+        createRequest(client); // Sent POST request
         return Plugin_Handled;
     }
 
     ChangeClientTeam(client, CS_TEAM_SPECTATOR);
     Queue_Enqueue(g_hWaitingQueue, client);
     Retakes_Message(client, "%t", "JoinedQueueMessage");
+    createRequest(client); // Sent POST request
     return Plugin_Handled;
 }
 
@@ -665,6 +683,69 @@ public Action Event_RoundEnd(Event event, const char[] name, bool dontBroadcast)
 public Action Event_HalfTime(Event event, const char[] name, bool dontBroadcast)
 {
     g_HalfTime = true;
+}
+
+/***********************
+ *                     *
+ *    HTTPS Requests   *
+ *                     *
+ ***********************/
+
+/**
+ * Called when some event need to be sended to the Jaguares CSGO Api
+ */
+
+ public void createRequest(int client) {
+
+    char[] url = new char[64];
+	char[] apiToken = new char[80];
+    char[] userSteamID = new char[32];
+    char[] serverPort = new char[5];
+    int tHumanCount=0, ctHumanCount=0, nPlayers=0;
+    int minPlayers;
+	
+	g_ApiEndPointCvar.GetString(url, 64);
+	g_ApiTokenCvar.GetString(apiToken, 80);
+    g_serverPortCvar.GetString(serverPort, 5);
+
+    GetTeamsClientCounts(tHumanCount, ctHumanCount);
+    nPlayers = tHumanCount + ctHumanCount;
+
+	GetClientAuthId(client, AuthId_SteamID64, userSteamID, 32);
+
+    minPlayers = g_minPlayersApitCvar.IntValue;
+    PrintToServer("Jogadores minimos: %i", minPlayers);
+    PrintToServer("Numero de jogadores: %i", nPlayers);
+	
+	if((url[1] && apiToken[1] && userSteamID[1] && serverPort[1]) && minPlayers < nPlayers){
+
+		sendRequest(url, apiToken, userSteamID, serverPort);
+	}
+ }
+
+ public void sendRequest(char[] endPoint, char[] apiToken, char[] steamid64, char[] serverPort){
+
+	System2HTTPRequest httpRequest = new System2HTTPRequest(HttpResponseCallback, endPoint);
+	httpRequest.Timeout = 60;
+	httpRequest.SetHeader("Authorization", "Bearer %s", apiToken);
+	httpRequest.SetHeader("Content-Type", "application/x-www-form-urlencoded");
+	httpRequest.SetUserAgent("Mozilla");
+	httpRequest.SetHeader("Accept", "application/json");
+	httpRequest.SetData("action=jointeam&steamid64=%s&port=%s", steamid64, serverPort); 
+	httpRequest.POST(); 
+}
+
+void HttpResponseCallback(bool success, const char[] error, System2HTTPRequest request, System2HTTPResponse response, HTTPRequestMethod method) {
+    if(success) {
+    	PrintToServer("Sucesso, significa que o envio do POST request foi realizado!");
+    } else {
+    	PrintToServer("DEU RUIM =(");
+    }
+    
+    if(error[0]){}
+    if(request){}
+    if(response){}
+    if(method){}
 }
 
 /***********************
