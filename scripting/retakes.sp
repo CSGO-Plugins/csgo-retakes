@@ -62,7 +62,6 @@ ConVar g_WarmupTimeCvar;
 ConVar g_ApiEndPointCvar;
 ConVar g_ApiTokenCvar;
 ConVar g_serverPortCvar;
-ConVar g_minPlayersApitCvar;
 
 
 /** Editing global variables **/
@@ -92,6 +91,9 @@ SpawnType g_EditingSpawnTypes[MAXPLAYERS+1];
 /** Bomb-site stuff read from the map **/
 ArrayList g_SiteMins;
 ArrayList g_SiteMaxs;
+
+/** Jaguares CSGO: Array to controla last team players where part of **/
+ArrayList g_PlayersLastTeam;
 
 /** Data created for the current retake scenario **/
 Bombsite g_Bombsite;
@@ -141,7 +143,7 @@ Handle g_OnWeaponsAllocated;
 
 public Plugin myinfo = {
     name = "CS:GO Retakes - Jaguares CSGO",
-    author = "splewis and modded by Henrique",
+    author = "splewis and modded by HenriqueSSS",
     description = "CS:GO Retake practice - With API requests",
     version = PLUGIN_VERSION,
     url = "https://github.com/splewis/csgo-retakes"
@@ -165,7 +167,6 @@ public void OnPluginStart() {
 	g_ApiEndPointCvar = CreateConVar("sm_api_endpoint", "", "Set the endpoint for the Jaguares CSGO API");
 	g_ApiTokenCvar = CreateConVar("sm_api_token", "", "Set the API token");
 	g_serverPortCvar = CreateConVar("sm_server_port", "", "Server port used to identify the server on Jaguares CSGO API");
-	g_minPlayersApitCvar = CreateConVar("sm_notify_min", "8", "Minimun number of connected players required in order to send notifications");
 
     g_EnabledCvar.AddChangeHook(EnabledChanged);
 
@@ -229,6 +230,7 @@ public void OnPluginStart() {
 
     g_SiteMins = new ArrayList(3);
     g_SiteMaxs = new ArrayList(3);
+    g_PlayersLastTeam = new ArrayList();
     g_hWaitingQueue = Queue_Init();
     g_hRankingQueue = PQ_Init();
 
@@ -247,6 +249,7 @@ public void OnPluginEnd() {
 public void OnMapStart() {
     PQ_Clear(g_hRankingQueue);
     Queue_Clear(g_hWaitingQueue);
+    clearSpecArray();
     g_ScrambleSignal = false;
     g_WinStreak = 0;
     g_RoundCount = 0;
@@ -395,7 +398,6 @@ public Action Command_JoinTeam(int client, const char[] command, int argc) {
     // if same team, teamswitch controlled by the plugin
     // note if a player hits autoselect their team_from=team_to=CS_TEAM_NONE
     if ((team_from == team_to && team_from != CS_TEAM_NONE) || g_PluginTeamSwitch[client] || IsFakeClient(client)) {
-        createRequest(client); // Sent POST request
         return Plugin_Continue;
     } else {
         // ignore switches between T/CT team
@@ -404,6 +406,7 @@ public Action Command_JoinTeam(int client, const char[] command, int argc) {
             return Plugin_Handled;
 
         } else if (team_to == CS_TEAM_SPECTATOR || team_from == CS_TEAM_CT || team_from == CS_TEAM_T) {
+        //} else if (team_to == CS_TEAM_SPECTATOR) {
             // voluntarily joining spectator will not put you in the queue
             //SwitchPlayerTeam(client, CS_TEAM_SPECTATOR);
             //Queue_Drop(g_hWaitingQueue, client);
@@ -414,7 +417,6 @@ public Action Command_JoinTeam(int client, const char[] command, int argc) {
 
             return Plugin_Handled;
         } else {
-            createRequest(client); // Sent POST request
             return PlacePlayer(client);
         }
     }
@@ -436,14 +438,15 @@ public Action PlacePlayer(int client) {
         ChangeClientTeam(client, CS_TEAM_SPECTATOR);
         Queue_Enqueue(g_hWaitingQueue, client);
         CS_TerminateRound(0.0, CSRoundEnd_CTWin);
-        createRequest(client); // Sent POST request
         return Plugin_Handled;
     }
 
     ChangeClientTeam(client, CS_TEAM_SPECTATOR);
     Queue_Enqueue(g_hWaitingQueue, client);
+    if(!isPlayerInSpecArray(client)) {
+        addPlayerToSpecArray(client);
+    }
     Retakes_Message(client, "%t", "JoinedQueueMessage");
-    createRequest(client); // Sent POST request
     return Plugin_Handled;
 }
 
@@ -695,35 +698,26 @@ public Action Event_HalfTime(Event event, const char[] name, bool dontBroadcast)
  * Called when some event need to be sended to the Jaguares CSGO Api
  */
 
- public void createRequest(int client) {
+ public void createRequest(int client, int identifier) {
 
     char[] url = new char[64];
 	char[] apiToken = new char[80];
     char[] userSteamID = new char[32];
-    char[] serverPort = new char[5];
-    int tHumanCount=0, ctHumanCount=0, nPlayers=0;
-    int minPlayers;
+    char[] serverPort = new char[6];
 	
 	g_ApiEndPointCvar.GetString(url, 64);
 	g_ApiTokenCvar.GetString(apiToken, 80);
-    g_serverPortCvar.GetString(serverPort, 5);
-
-    GetTeamsClientCounts(tHumanCount, ctHumanCount);
-    nPlayers = tHumanCount + ctHumanCount;
+    g_serverPortCvar.GetString(serverPort, 6);
 
 	GetClientAuthId(client, AuthId_SteamID64, userSteamID, 32);
-
-    minPlayers = g_minPlayersApitCvar.IntValue;
-    PrintToServer("Jogadores minimos: %i", minPlayers);
-    PrintToServer("Numero de jogadores: %i", nPlayers);
 	
-	if((url[1] && apiToken[1] && userSteamID[1] && serverPort[1]) && minPlayers < nPlayers){
+	if(url[1] && apiToken[1] && userSteamID[1] && serverPort[1]){
 
-		sendRequest(url, apiToken, userSteamID, serverPort);
+		sendRequest(url, apiToken, userSteamID, serverPort, identifier);
 	}
  }
 
- public void sendRequest(char[] endPoint, char[] apiToken, char[] steamid64, char[] serverPort){
+ public void sendRequest(char[] endPoint, char[] apiToken, char[] steamid64, char[] serverPort, int identifier){
 
 	System2HTTPRequest httpRequest = new System2HTTPRequest(HttpResponseCallback, endPoint);
 	httpRequest.Timeout = 60;
@@ -731,7 +725,7 @@ public Action Event_HalfTime(Event event, const char[] name, bool dontBroadcast)
 	httpRequest.SetHeader("Content-Type", "application/x-www-form-urlencoded");
 	httpRequest.SetUserAgent("Mozilla");
 	httpRequest.SetHeader("Accept", "application/json");
-	httpRequest.SetData("action=jointeam&steamid64=%s&port=%s", steamid64, serverPort); 
+	httpRequest.SetData("action=jointeam&steamid64=%s&port=%s&identifier=%i", steamid64, serverPort, identifier); 
 	httpRequest.POST(); 
 }
 
@@ -746,6 +740,30 @@ void HttpResponseCallback(bool success, const char[] error, System2HTTPRequest r
     if(request){}
     if(response){}
     if(method){}
+}
+
+//LINK Players Spec Array Functions
+public bool isPlayerInSpecArray(int client) {
+    return g_PlayersLastTeam.FindValue(client) >= 0;
+}
+
+public int getPlayerSpecIndex(int client) {
+    return g_PlayersLastTeam.FindValue(client);
+}
+
+public void addPlayerToSpecArray(int client) {
+    g_PlayersLastTeam.Push(client);
+}
+
+public void removePlayerFromSpecArray(int client) {
+    int index = g_PlayersLastTeam.FindValue(client);
+    if(index >= 0) {
+        g_PlayersLastTeam.Erase(index);
+    }
+}
+
+public void clearSpecArray() {
+    g_PlayersLastTeam.Clear();
 }
 
 /***********************
@@ -887,6 +905,13 @@ public void UpdateTeams() {
             g_PlayerHealth[client] = 100;
             g_PlayerArmor[client] = 100;
             g_PlayerHelmet[client] = true;
+
+            if(Retakes_IsJoined(client)){
+                if(getPlayerSpecIndex(client) != -1) {
+                    createRequest(client, 3); // Sent POST request
+                    removePlayerFromSpecArray(client);
+                } 
+            }
         }
     }
 
@@ -902,6 +927,13 @@ public void UpdateTeams() {
             g_PlayerHealth[client] = 100;
             g_PlayerArmor[client] = 100;
             g_PlayerHelmet[client] = true;
+
+            if(Retakes_IsJoined(client)){
+                if(getPlayerSpecIndex(client) != -1) {
+                    createRequest(client, 3); // Sent POST request
+                    removePlayerFromSpecArray(client);
+                } 
+            }
         }
     }
 
@@ -910,6 +942,9 @@ public void UpdateTeams() {
         int client = PQ_Dequeue(g_hRankingQueue);
         if (IsPlayer(client)) {
             Queue_EnqueueFront(g_hWaitingQueue, client);
+            if(Retakes_IsInQueue(client)) {
+                addPlayerToSpecArray(client);
+            }
         }
     }
 
@@ -923,6 +958,9 @@ public void UpdateTeams() {
     for (int i = 0; i < length; i++) {
         int client = g_hWaitingQueue.Get(i);
         if (IsValidClient(client)) {
+            if(Retakes_IsInQueue(client)) {
+                addPlayerToSpecArray(client);
+            }
             Retakes_Message(client, "%t", "WaitingQueueMessage", g_hMaxPlayers.IntValue);
         }
     }
